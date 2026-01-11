@@ -1,0 +1,19 @@
+{
+  "name": "MMM-PageBtn",
+  "version": "1.0.0",
+  "description": "MagicMirror² module for GPIO button control of MMM-Pages",
+  "main": "node_helper.js",
+  "keywords": [
+    "MagicMirror",
+    "MMM",
+    "GPIO",
+    "button",
+    "pages"
+  ],
+  "author": "sonnyb9",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sonnyb9/MMM-PageBtn"
+  }
+}
