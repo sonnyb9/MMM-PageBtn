@@ -7,9 +7,15 @@ module.exports = NodeHelper.create({
     this.gpioProcess = null;
     this.pressStartTime = null;
 
+    // Buffer for stdout so we can reliably process line-delimited gpiomon output
+    this._stdoutBuf = "";
+
     // Compatibility toggles for different libgpiod/gpiomon builds
     this._useDebounce = true;
     this._restartPending = false;
+
+    // Prefer stdbuf to force line-buffered output; fall back if not available.
+    this._useStdbuf = true;
   },
 
   socketNotificationReceived: function (notification, payload) {
@@ -19,6 +25,7 @@ module.exports = NodeHelper.create({
       // Reset compatibility toggles on init
       this._useDebounce = true;
       this._restartPending = false;
+      this._useStdbuf = true;
 
       this.startGpioMonitor();
     }
@@ -33,6 +40,20 @@ module.exports = NodeHelper.create({
       }
       this.gpioProcess = null;
     }
+  },
+
+  spawnGpioMon: function (args) {
+    // Reset stdout buffer each time we start a fresh process
+    this._stdoutBuf = "";
+
+    if (this._useStdbuf) {
+      // Force line-buffered stdout/stderr so events appear immediately when spawned by Node.
+      // stdbuf is typically provided by coreutils on Raspberry Pi OS.
+      return spawn("stdbuf", ["-oL", "-eL", "gpiomon", ...args]);
+    }
+
+    // Fallback path if stdbuf is not available
+    return spawn("gpiomon", args);
   },
 
   startGpioMonitor: function () {
@@ -53,13 +74,20 @@ module.exports = NodeHelper.create({
 
     args.push(chip, String(line));
 
-    this.debug("Starting gpiomon with args: " + args.join(" "));
+    this.debug("Starting gpiomon with args: " + args.join(" ") + (this._useStdbuf ? " (via stdbuf)" : ""));
 
-    this.gpioProcess = spawn("gpiomon", args);
+    this.gpioProcess = this.spawnGpioMon(args);
 
     this.gpioProcess.stdout.on("data", (data) => {
-      const lines = data.toString().trim().split("\n");
-      lines.forEach((line) => this.handleGpioEvent(line));
+      // Robust line buffering: handle partial chunks and multiple lines in one chunk.
+      this._stdoutBuf += data.toString();
+
+      let idx;
+      while ((idx = this._stdoutBuf.indexOf("\n")) !== -1) {
+        const line = this._stdoutBuf.slice(0, idx).trim();
+        this._stdoutBuf = this._stdoutBuf.slice(idx + 1);
+        if (line) this.handleGpioEvent(line);
+      }
     });
 
     this.gpioProcess.stderr.on("data", (data) => {
@@ -100,6 +128,14 @@ module.exports = NodeHelper.create({
     });
 
     this.gpioProcess.on("error", (err) => {
+      // If stdbuf isn't installed, fall back to running gpiomon directly.
+      if (this._useStdbuf && err && err.code === "ENOENT") {
+        this.debug('stdbuf not found; falling back to spawning "gpiomon" directly.');
+        this._useStdbuf = false;
+        setTimeout(() => this.startGpioMonitor(), 250);
+        return;
+      }
+
       this.sendSocketNotification("GPIO_ERROR", "Failed to start gpiomon: " + err.message);
       setTimeout(() => this.startGpioMonitor(), 5000);
     });
