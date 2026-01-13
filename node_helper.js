@@ -5,7 +5,12 @@ module.exports = NodeHelper.create({
   start: function () {
     this.config = null;
     this.gpioProcess = null;
-    this.pressStartTime = null;
+
+    // Press state
+    this._pressed = false;
+    this._pressStartTime = null;
+    this._longPressTimer = null;
+    this._longPressFired = false;
 
     // Buffer for stdout so we can reliably process line-delimited gpiomon output
     this._stdoutBuf = "";
@@ -26,6 +31,15 @@ module.exports = NodeHelper.create({
       this._useDebounce = true;
       this._restartPending = false;
       this._useStdbuf = true;
+
+      // Reset press state
+      this._pressed = false;
+      this._pressStartTime = null;
+      this._longPressFired = false;
+      if (this._longPressTimer) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
+      }
 
       this.startGpioMonitor();
     }
@@ -48,7 +62,6 @@ module.exports = NodeHelper.create({
 
     if (this._useStdbuf) {
       // Force line-buffered stdout/stderr so events appear immediately when spawned by Node.
-      // stdbuf is typically provided by coreutils on Raspberry Pi OS.
       return spawn("stdbuf", ["-oL", "-eL", "gpiomon", ...args]);
     }
 
@@ -74,7 +87,11 @@ module.exports = NodeHelper.create({
 
     args.push(chip, String(line));
 
-    this.debug("Starting gpiomon with args: " + args.join(" ") + (this._useStdbuf ? " (via stdbuf)" : ""));
+    this.debug(
+      "Starting gpiomon with args: " +
+        args.join(" ") +
+        (this._useStdbuf ? " (via stdbuf)" : "")
+    );
 
     this.gpioProcess = this.spawnGpioMon(args);
 
@@ -144,32 +161,61 @@ module.exports = NodeHelper.create({
   handleGpioEvent: function (line) {
     this.debug("GPIO event: " + line);
 
-    // gpiomon emits "RISING EDGE" / "FALLING EDGE" (uppercase); normalize for matching.
     const normalized = (line || "").toLowerCase();
+    const now = Date.now();
+    const longPressMs = (this.config && this.config.longPressMs) || 1000;
 
+    // Press (FALLING with pull-up wiring)
     if (normalized.includes("falling")) {
-      this.pressStartTime = Date.now();
+      // Ignore bounce / duplicate FALLING while already pressed
+      if (this._pressed) return;
+
+      this._pressed = true;
+      this._pressStartTime = now;
+      this._longPressFired = false;
+
+      // Start long-press timer; fire LONG_PRESS at threshold even before release
+      if (this._longPressTimer) clearTimeout(this._longPressTimer);
+      this._longPressTimer = setTimeout(() => {
+        // Only fire if still pressed and not already fired
+        if (this._pressed && !this._longPressFired) {
+          this._longPressFired = true;
+          this.debug("Long press detected (timer fired)");
+          this.sendSocketNotification("LONG_PRESS");
+        }
+      }, longPressMs);
+
       this.debug("Button pressed (falling edge)");
-    } else if (normalized.includes("rising")) {
-      if (this.pressStartTime === null) {
-        this.debug("Rising edge without prior falling edge, ignoring");
+      return;
+    }
+
+    // Release (RISING)
+    if (normalized.includes("rising")) {
+      // Ignore stray RISING if we never saw a press
+      if (!this._pressed) return;
+
+      this._pressed = false;
+
+      if (this._longPressTimer) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
+      }
+
+      const duration = this._pressStartTime ? now - this._pressStartTime : 0;
+      this._pressStartTime = null;
+
+      this.debug("Button released (rising edge), duration: " + duration + "ms");
+
+      // If long press already fired, do not also send SHORT_PRESS
+      if (this._longPressFired) {
+        this.debug("Release after long press; not sending short press.");
+        this._longPressFired = false; // reset for next cycle
         return;
       }
 
-      const pressDuration = Date.now() - this.pressStartTime;
-      this.pressStartTime = null;
-
-      this.debug("Button released (rising edge), duration: " + pressDuration + "ms");
-
-      const longPressMs = this.config.longPressMs || 1000;
-
-      if (pressDuration >= longPressMs) {
-        this.debug("Long press detected");
-        this.sendSocketNotification("LONG_PRESS");
-      } else {
-        this.debug("Short press detected");
-        this.sendSocketNotification("SHORT_PRESS");
-      }
+      // Otherwise it was a short press
+      this.debug("Short press detected");
+      this.sendSocketNotification("SHORT_PRESS");
     }
   },
 
@@ -181,6 +227,10 @@ module.exports = NodeHelper.create({
   },
 
   stop: function () {
+    if (this._longPressTimer) {
+      clearTimeout(this._longPressTimer);
+      this._longPressTimer = null;
+    }
     this.stopGpioMonitor();
   }
 });
