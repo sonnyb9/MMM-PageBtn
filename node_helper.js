@@ -45,6 +45,22 @@ module.exports = NodeHelper.create({
     }
   },
 
+  getLogMode: function () {
+    const raw = (this.config && this.config.logging) ? String(this.config.logging).toLowerCase() : null;
+    if (raw === "off" || raw === "on" || raw === "debug") return raw;
+
+    // Legacy support: if someone still passes debug boolean
+    if (this.config && this.config.debug === true) return "debug";
+    return "off";
+  },
+
+  debug: function (message) {
+    if (this.getLogMode() === "debug") {
+      console.log("[MMM-PageBtn] " + message);
+      this.sendSocketNotification("DEBUG", message);
+    }
+  },
+
   stopGpioMonitor: function () {
     if (this.gpioProcess) {
       try {
@@ -77,7 +93,7 @@ module.exports = NodeHelper.create({
     // Stop any previous gpiomon process before starting a new one
     this.stopGpioMonitor();
 
-    // Use split edge flags for compatibility (your Pi build doesn't support --edges=both)
+    // Use split edge flags for compatibility
     const args = ["--bias=pull-up", "--rising-edge", "--falling-edge"];
 
     // Some builds may not support --debounce; we fall back automatically if needed
@@ -216,13 +232,6 @@ module.exports = NodeHelper.create({
       // Otherwise it was a short press
       this.debug("Short press detected");
       this.sendSocketNotification("SHORT_PRESS");
-    }
-  },
-
-  debug: function (message) {
-    if (this.config && this.config.debug) {
-      console.log("[MMM-PageBtn] " + message);
-      this.sendSocketNotification("DEBUG", message);
     }
   },
 
