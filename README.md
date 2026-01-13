@@ -59,13 +59,19 @@ Add to your `config/config.js`:
 ```javascript
 {
   module: "MMM-PageBtn",
+  position: "top_left",       // Required by MagicMirror; any position is fine
   config: {
     gpioChip: "gpiochip0",    // GPIO device (default: gpiochip0)
     gpioLine: 17,             // BCM GPIO number (default: 17)
     longPressMs: 1000,        // Long press threshold in ms (default: 1000)
     resumeAfterMs: 300000,    // Auto-resume delay in ms (default: 300000 = 5 min)
     debounceMs: 50,           // Debounce window in ms (default: 50)
-    debug: false              // Enable verbose logging (default: false)
+
+    // Logging mode: "off" | "on" | "debug"
+    // - "off": minimal logging (errors only)
+    // - "on":  operational logs only (short/long/auto-resume)
+    // - "debug": verbose troubleshooting logs (GPIO events, spawn args, etc.)
+    logging: "on"
   }
 }
 ```
@@ -79,18 +85,37 @@ Add to your `config/config.js`:
 | `longPressMs` | number | `1000` | Minimum duration (ms) for long press |
 | `resumeAfterMs` | number | `300000` | Auto-resume delay after pause (ms) |
 | `debounceMs` | number | `50` | Software debounce window (ms) |
-| `debug` | boolean | `false` | Enable debug logging to console and browser |
+| `logging` | string | `"off"` | `"off"` = errors only, `"on"` = minimal operational logs, `"debug"` = verbose logs |
+
+#### Backward Compatibility (`debug`)
+Older configs using `debug: true|false` are still supported, but `debug` is deprecated in favor of `logging`:
+
+- `debug: false` behaves like `logging: "off"`
+- `debug: true` behaves like `logging: "debug"`
+
+If both are set, `logging` takes precedence.
+
+## Logging
+
+When `logging: "on"`, the module logs only these operational events:
+
+- `Short press detected`
+- `Long press detected`
+- `Auto-resume page rotation`
+
+When `logging: "debug"`, you will also see verbose troubleshooting logs (GPIO edge lines, gpiomon spawn arguments, restart/fallback messages).
 
 ## Behavior
 
 | Action | Trigger | MMM-Pages Notification |
 |--------|---------|------------------------|
-| Short press | Button held < 1 second | `PAGE_INCREMENT` (+ `RESUME_ROTATION` if paused) |
-| Long press | Button held ≥ 1 second | `PAUSE_ROTATION` |
-| Auto-resume | 5 minutes after long press | `RESUME_ROTATION` |
+| Short press | Button held < `longPressMs` | `PAGE_INCREMENT` (+ `RESUME_ROTATION` if paused) |
+| Long press | Button held ≥ `longPressMs` | `PAUSE_ROTATION` |
+| Auto-resume | `resumeAfterMs` after long press | `RESUME_ROTATION` |
 
 ### Notes
 
+- Long press fires when the threshold is reached (you do not need to release first)
 - Repeated long presses reset the auto-resume timer
 - Short presses resume rotation if paused (and cancel auto-resume timer)
 - Restarting MagicMirror clears the pause state
@@ -102,7 +127,13 @@ Add to your `config/config.js`:
 1. Verify `gpiod` is installed: `which gpiomon`
 2. Test GPIO manually: `sudo gpiomon --bias=pull-up --rising-edge --falling-edge gpiochip0 17`
 3. Check wiring — button should connect GPIO (pin 11) to GND (pin 9 or any of the other GND pins available)
-4. Enable debug mode: `debug: true` in config
+4. Enable troubleshooting logs: set `logging: "debug"` (or legacy `debug: true`)
+
+### Device or resource busy
+
+If `gpiomon` reports the GPIO line is busy, MagicMirror (or another process) is already monitoring that GPIO line.
+
+- Stop MagicMirror, test with `gpiomon`, then start MagicMirror again.
 
 ### Permission denied
 
