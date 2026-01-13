@@ -5,184 +5,237 @@ module.exports = NodeHelper.create({
   start: function () {
     this.config = null;
     this.gpioProcess = null;
-    this.pressStartTime = null;
 
-    // Compatibility toggles for different libgpiod/gpiomon builds
-    this._useDebounce = true;
+    // Press state
+    this._pressed = false;
+    this._longPressTimer = null;
+    this._longPressFired = false;
+
+    // stdout line buffering
+    this._stdoutBuf = "";
+
+    // gpiomon compatibility
+    this._useDebounceFlag = true;
     this._restartPending = false;
 
-    // Software debounce fallback (when gpiomon --debounce isn't supported)
-    this._lastAcceptedEventAt = 0;
+    // software debounce fallback (ms)
+    this._lastAcceptedMs = 0;
+
+    // Absolute path (avoids PATH issues under pm2)
+    this._stdbuf = "/usr/bin/stdbuf";
   },
 
   socketNotificationReceived: function (notification, payload) {
-    if (notification !== "INIT") return;
+    if (notification === "INIT") {
+      this.config = payload || {};
 
-    this.config = payload || {};
+      // normalize logging -> debug boolean for helper chatter
+      const mode = this._logMode();
+      this.config.debug = mode === "debug";
 
-    // Normalize logging mode -> boolean debug for helper logging
-    // logging: "debug" => debug=true
-    // logging: "on"/"off" => debug=false (no noisy debug)
-    const logMode = String(this.config.logging || "").toLowerCase();
-    const effectiveDebug =
-      logMode === "debug" ? true :
-      (typeof this.config.debug === "boolean" ? this.config.debug : false);
+      // reset state
+      this._pressed = false;
+      this._longPressFired = false;
+      if (this._longPressTimer) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
+      }
 
-    this.config.debug = effectiveDebug;
+      this._stdoutBuf = "";
+      this._useDebounceFlag = true;
+      this._restartPending = false;
+      this._lastAcceptedMs = 0;
 
-    // Reset compatibility toggles on init
-    this._useDebounce = true;
-    this._restartPending = false;
+      this._startGpioMon();
+      return;
+    }
 
-    // Reset debounce timing
-    this._lastAcceptedEventAt = 0;
-    this.pressStartTime = null;
-
-    this.startGpioMonitor();
+    // Operational event logs should land in pm2 logs
+    if (notification === "EVENT_LOG") {
+      const mode = this._logMode();
+      if (mode === "on" || mode === "debug") {
+        console.log("[MMM-PageBtn] " + String(payload || ""));
+      }
+      return;
+    }
   },
 
-  stopGpioMonitor: function () {
+  _logMode: function () {
+    const raw = this.config && this.config.logging ? String(this.config.logging).toLowerCase() : "";
+    if (raw === "off" || raw === "on" || raw === "debug") return raw;
+
+    // legacy support
+    if (this.config && this.config.debug === true) return "debug";
+    return "off";
+  },
+
+  _debug: function (msg) {
+    if (this._logMode() === "debug") {
+      console.log("[MMM-PageBtn] " + msg);
+      this.sendSocketNotification("DEBUG", msg);
+    }
+  },
+
+  _stopGpioMon: function () {
     if (this.gpioProcess) {
-      try {
-        this.gpioProcess.kill();
-      } catch (e) {
-        // ignore
-      }
+      try { this.gpioProcess.kill(); } catch (_) {}
       this.gpioProcess = null;
     }
   },
 
-  startGpioMonitor: function () {
+  _spawnGpioMon: function (args) {
+    this._stdoutBuf = "";
+
+    // Force line buffered stdout/stderr:
+    // stdbuf -oL -eL gpiomon <args...>
+    return spawn(this._stdbuf, ["-oL", "-eL", "gpiomon", ...args]);
+  },
+
+  _startGpioMon: function () {
     const chip = this.config.gpioChip || "gpiochip0";
     const line = this.config.gpioLine || 17;
     const debounceUs = (this.config.debounceMs || 50) * 1000;
 
-    // Stop any previous gpiomon process before starting a new one
-    this.stopGpioMonitor();
+    this._stopGpioMon();
 
-    // Use split edge flags for compatibility (your Pi build doesn't support --edges=both)
     const args = ["--bias=pull-up", "--rising-edge", "--falling-edge"];
 
-    // Some builds may not support --debounce; we fall back automatically if needed
-    if (this._useDebounce) {
-      args.push("--debounce=" + debounceUs + "us");
+    // Try gpiomon debounce first; auto-fallback if unsupported.
+    if (this._useDebounceFlag) {
+      args.push(`--debounce=${debounceUs}us`);
     }
 
     args.push(chip, String(line));
 
-    this.debug("Starting gpiomon with args: " + args.join(" "));
+    this._debug("Starting gpiomon with args: " + args.join(" ") + " (via /usr/bin/stdbuf)");
 
-    this.gpioProcess = spawn("gpiomon", args);
+    this.gpioProcess = this._spawnGpioMon(args);
 
     this.gpioProcess.stdout.on("data", (data) => {
-      const lines = data.toString().trim().split("\n");
-      lines.forEach((l) => this.handleGpioEvent(l));
+      this._stdoutBuf += data.toString();
+
+      let idx;
+      while ((idx = this._stdoutBuf.indexOf("\n")) !== -1) {
+        const line = this._stdoutBuf.slice(0, idx).trim();
+        this._stdoutBuf = this._stdoutBuf.slice(idx + 1);
+        if (line) this._handleEvent(line);
+      }
     });
 
     this.gpioProcess.stderr.on("data", (data) => {
       const msg = data.toString();
       this.sendSocketNotification("GPIO_ERROR", msg);
 
-      // Compatibility fallback: some gpiomon/libgpiod builds do not support --debounce
+      // Detect unsupported --debounce and restart without it
       const lower = msg.toLowerCase();
       if (
-        this._useDebounce &&
+        this._useDebounceFlag &&
         !this._restartPending &&
         lower.includes("unrecognized option") &&
         lower.includes("debounce")
       ) {
-        this.debug("gpiomon does not support --debounce; restarting without debounce.");
-        this._useDebounce = false;
+        this._debug("gpiomon does not support --debounce; restarting without debounce.");
+        this._useDebounceFlag = false;
         this._restartPending = true;
 
-        this.stopGpioMonitor();
+        this._stopGpioMon();
         setTimeout(() => {
           this._restartPending = false;
-          this.startGpioMonitor();
+          this._startGpioMon();
         }, 250);
       }
     });
 
     this.gpioProcess.on("close", (code) => {
-      this.debug("gpiomon exited with code " + code);
-
-      // If we're in the middle of a controlled restart, don't schedule another restart
+      this._debug("gpiomon exited with code " + code);
       if (this._restartPending) return;
 
       if (code !== 0 && code !== null) {
         this.sendSocketNotification("GPIO_ERROR", "gpiomon exited with code " + code);
-        setTimeout(() => this.startGpioMonitor(), 5000);
+        setTimeout(() => this._startGpioMon(), 5000);
       }
     });
 
     this.gpioProcess.on("error", (err) => {
-      this.sendSocketNotification("GPIO_ERROR", "Failed to start gpiomon: " + err.message);
-      setTimeout(() => this.startGpioMonitor(), 5000);
+      this.sendSocketNotification("GPIO_ERROR", "Failed to start gpiomon via stdbuf: " + err.message);
+      setTimeout(() => this._startGpioMon(), 5000);
     });
   },
 
-  handleGpioEvent: function (line) {
-    // Normalize
-    const normalized = (line || "").toLowerCase();
+  _handleEvent: function (rawLine) {
+    this._debug("GPIO event: " + rawLine);
 
-    // Software debounce fallback:
-    // When gpiomon lacks --debounce, some switches produce rapid bursts of edges.
-    // Ignore any events occurring within debounceMs of the last accepted event.
+    const s = String(rawLine).toLowerCase();
     const now = Date.now();
-    const debounceMs = this.config.debounceMs || 50;
-    if (now - this._lastAcceptedEventAt < debounceMs) {
-      this.debug("Debounce: ignoring event: " + line);
+
+      // Edge-aware debounce:
+      // - Do NOT time-filter rising edges needed to end a press.
+      // - Ignore bounce by state: duplicate FALLING while pressed, duplicate RISING while released.
+      // - Keep a lightweight time filter only for identical-edge spam when state is ambiguous.
+      const debounceMs = this.config.debounceMs || 50;
+
+      const isFalling = s.includes("falling");
+      const isRising = s.includes("rising");
+
+      // If neither rising nor falling, ignore
+      if (!isFalling && !isRising) return;
+
+      // Optional time filter for same-edge chatter only
+      if (now - this._lastAcceptedMs < debounceMs) {
+        // Allow a RISING to end a press even if within debounce window
+        if (!(isRising && this._pressed)) {
+          this._debug("Debounce: ignored event within " + debounceMs + "ms");
+          return;
+        }
+      }
+      this._lastAcceptedMs = now;
+
+    const longPressMs = this.config.longPressMs || 1000;
+
+    // FALLING = press (active-low)
+    if (s.includes("falling")) {
+      if (this._pressed) return;
+
+      this._pressed = true;
+      this._longPressFired = false;
+
+      if (this._longPressTimer) clearTimeout(this._longPressTimer);
+      this._longPressTimer = setTimeout(() => {
+        if (this._pressed && !this._longPressFired) {
+          this._longPressFired = true;
+          this.sendSocketNotification("LONG_PRESS");
+        }
+      }, longPressMs);
+
       return;
     }
 
-    // Accept this event
-    this._lastAcceptedEventAt = now;
+    // RISING = release
+    if (s.includes("rising")) {
+      if (!this._pressed) return;
 
-    this.debug("GPIO event: " + line);
+      this._pressed = false;
 
-    if (normalized.includes("falling")) {
-      // If we already think the button is down, ignore extra falling edges
-      if (this.pressStartTime !== null) {
-        this.debug("Extra falling edge while pressed; ignoring");
+      if (this._longPressTimer) {
+        clearTimeout(this._longPressTimer);
+        this._longPressTimer = null;
+      }
+
+      // If long already fired, do not also short-press
+      if (this._longPressFired) {
+        this._longPressFired = false;
         return;
       }
 
-      this.pressStartTime = now;
-      this.debug("Button pressed (falling edge)");
-      return;
-    }
-
-    if (normalized.includes("rising")) {
-      if (this.pressStartTime === null) {
-        this.debug("Rising edge without prior falling edge, ignoring");
-        return;
-      }
-
-      const pressDuration = now - this.pressStartTime;
-      this.pressStartTime = null;
-
-      this.debug("Button released (rising edge), duration: " + pressDuration + "ms");
-
-      const longPressMs = this.config.longPressMs || 1000;
-
-      if (pressDuration >= longPressMs) {
-        this.debug("Long press detected");
-        this.sendSocketNotification("LONG_PRESS");
-      } else {
-        this.debug("Short press detected");
-        this.sendSocketNotification("SHORT_PRESS");
-      }
-    }
-  },
-
-  debug: function (message) {
-    if (this.config && this.config.debug) {
-      console.log("[MMM-PageBtn] " + message);
-      this.sendSocketNotification("DEBUG", message);
+      this.sendSocketNotification("SHORT_PRESS");
     }
   },
 
   stop: function () {
-    this.stopGpioMonitor();
+    if (this._longPressTimer) {
+      clearTimeout(this._longPressTimer);
+      this._longPressTimer = null;
+    }
+    this._stopGpioMon();
   }
 });

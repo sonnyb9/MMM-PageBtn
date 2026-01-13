@@ -8,39 +8,59 @@ Module.register("MMM-PageBtn", {
     resumeAfterMs: 300000,
     debounceMs: 50,
 
-    // New logging mode: "off" | "on" | "debug"
-    // Back-compat: debug:true -> "debug", debug:false -> "off"
+    // "off" | "on" | "debug"
     logging: "off",
-    debug: false // deprecated (kept for backward compatibility)
+
+    // legacy (deprecated)
+    debug: false
   },
 
   start: function () {
     this.paused = false;
     this.resumeTimer = null;
 
-    // Determine effective log level
-    this.logLevel = this._getLogLevel(this.config);
+    this.logMode = this._getLogMode();
 
-    // Ensure node_helper sees a boolean debug flag (for DEBUG socket messages)
-    // so older helper logic remains compatible.
-    this.config.debug = this.logLevel === "debug";
+    // Send normalized config to helper
+    const cfg = Object.assign({}, this.config, {
+      logging: this.logMode,
+      debug: this.logMode === "debug"
+    });
 
-    // Send init to node_helper
-    this.sendSocketNotification("INIT", this.config);
+    this.sendSocketNotification("INIT", cfg);
 
-    if (this.logLevel === "debug") {
+    if (this.logMode === "debug") {
       Log.log("[MMM-PageBtn] Initialized (logging=debug)");
+    }
+  },
+
+  _getLogMode: function () {
+    const raw = this.config && this.config.logging ? String(this.config.logging).toLowerCase() : "";
+    if (raw === "off" || raw === "on" || raw === "debug") return raw;
+
+    // legacy support
+    if (this.config && this.config.debug === true) return "debug";
+    return "off";
+  },
+
+  // Make operational logs land in PM2 logs by sending to node_helper
+  _eventLog: function (msg) {
+    if (this.logMode === "on" || this.logMode === "debug") {
+      this.sendSocketNotification("EVENT_LOG", msg);
+    }
+    if (this.logMode === "debug") {
+      Log.log("[MMM-PageBtn] " + msg);
     }
   },
 
   socketNotificationReceived: function (notification, payload) {
     if (notification === "SHORT_PRESS") {
-      this.handleShortPress();
+      this._handleShortPress();
       return;
     }
 
     if (notification === "LONG_PRESS") {
-      this.handleLongPress();
+      this._handleLongPress();
       return;
     }
 
@@ -49,43 +69,31 @@ Module.register("MMM-PageBtn", {
       return;
     }
 
-    // DEBUG messages only in debug mode
-    if (notification === "DEBUG" && this.logLevel === "debug") {
+    if (notification === "DEBUG" && this.logMode === "debug") {
       Log.log("[MMM-PageBtn] " + payload);
     }
   },
 
-  handleShortPress: function () {
-    // Minimal operational logging
-    if (this.logLevel === "on" || this.logLevel === "debug") {
-      Log.log("[MMM-PageBtn] Short press detected");
-    }
+  _handleShortPress: function () {
+    this._eventLog("Short press detected");
 
     this.sendNotification("PAGE_INCREMENT");
 
-    // If paused, resume immediately on short press (behavior unchanged)
+    // If paused, resume immediately and cancel auto-resume timer
     if (this.paused) {
       this.paused = false;
-
       if (this.resumeTimer) {
         clearTimeout(this.resumeTimer);
         this.resumeTimer = null;
       }
-
       this.sendNotification("RESUME_ROTATION");
-
-      if (this.logLevel === "debug") {
-        Log.log("[MMM-PageBtn] Resumed rotation via short press");
-      }
     }
   },
 
-  handleLongPress: function () {
-    if (this.logLevel === "on" || this.logLevel === "debug") {
-      Log.log("[MMM-PageBtn] Long press detected");
-    }
+  _handleLongPress: function () {
+    this._eventLog("Long press detected");
 
-    // Reset existing timer
+    // Reset any existing auto-resume timer
     if (this.resumeTimer) {
       clearTimeout(this.resumeTimer);
       this.resumeTimer = null;
@@ -95,38 +103,14 @@ Module.register("MMM-PageBtn", {
     if (!this.paused) {
       this.paused = true;
       this.sendNotification("PAUSE_ROTATION");
-
-      if (this.logLevel === "debug") {
-        Log.log("[MMM-PageBtn] Sent PAUSE_ROTATION");
-      }
     }
 
-    // Auto-resume timer
+    // Auto-resume after configured delay
     this.resumeTimer = setTimeout(() => {
       this.paused = false;
       this.sendNotification("RESUME_ROTATION");
-
-      // Minimal operational logging requirement
-      if (this.logLevel === "on" || this.logLevel === "debug") {
-        Log.log("[MMM-PageBtn] Auto-resume page rotation");
-      }
-
-      if (this.logLevel === "debug") {
-        Log.log("[MMM-PageBtn] Sent RESUME_ROTATION");
-      }
+      this._eventLog("Auto-resume page rotation");
     }, this.config.resumeAfterMs);
-  },
-
-  _getLogLevel: function (cfg) {
-    const raw = (cfg && cfg.logging) ? String(cfg.logging).toLowerCase() : "";
-    if (raw === "off" || raw === "on" || raw === "debug") return raw;
-
-    // Backward compatibility with debug: true/false
-    if (cfg && typeof cfg.debug === "boolean") {
-      return cfg.debug ? "debug" : "off";
-    }
-
-    return "off";
   },
 
   getDom: function () {
