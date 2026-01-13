@@ -1,115 +1,132 @@
+/* global Module, Log */
+
 Module.register("MMM-PageBtn", {
   defaults: {
+    gpioChip: "gpiochip0",
+    gpioLine: 17,
     longPressMs: 1000,
     resumeAfterMs: 300000,
-    // New: logging mode: "off" | "on" | "debug"
-    logging: "off"
-    // Back-compat: users may still have config.debug; handled in code below.
+    debounceMs: 50,
+
+    // New logging mode: "off" | "on" | "debug"
+    // Back-compat: debug:true -> "debug", debug:false -> "off"
+    logging: "off",
+    debug: false // deprecated (kept for backward compatibility)
   },
 
   start: function () {
     this.paused = false;
     this.resumeTimer = null;
 
-    // Cache logging mode once at startup
-    this.logMode = this.getLogMode();
+    // Determine effective log level
+    this.logLevel = this._getLogLevel(this.config);
 
-    // Send config to node_helper (include derived logging so helper can honor it too)
-    const cfg = Object.assign({}, this.config, { logging: this.logMode });
-    this.sendSocketNotification("INIT", cfg);
-  },
+    // Ensure node_helper sees a boolean debug flag (for DEBUG socket messages)
+    // so older helper logic remains compatible.
+    this.config.debug = this.logLevel === "debug";
 
-  // Determine effective logging mode:
-  // - Prefer config.logging if provided
-  // - Else fall back to legacy config.debug boolean
-  getLogMode: function () {
-    const raw = (this.config && this.config.logging) ? String(this.config.logging).toLowerCase() : null;
-    if (raw === "off" || raw === "on" || raw === "debug") return raw;
+    // Send init to node_helper
+    this.sendSocketNotification("INIT", this.config);
 
-    // Legacy support
-    if (this.config && this.config.debug === true) return "debug";
-    return "off";
-  },
-
-  // Minimal operational logs for "on"; verbose for "debug"
-  logOn: function (message) {
-    if (this.logMode === "on" || this.logMode === "debug") {
-      Log.log("[MMM-PageBtn] " + message);
-    }
-  },
-
-  logDebug: function (message) {
-    if (this.logMode === "debug") {
-      Log.log("[MMM-PageBtn] " + message);
+    if (this.logLevel === "debug") {
+      Log.log("[MMM-PageBtn] Initialized (logging=debug)");
     }
   },
 
   socketNotificationReceived: function (notification, payload) {
     if (notification === "SHORT_PRESS") {
       this.handleShortPress();
-    } else if (notification === "LONG_PRESS") {
+      return;
+    }
+
+    if (notification === "LONG_PRESS") {
       this.handleLongPress();
-    } else if (notification === "GPIO_ERROR") {
+      return;
+    }
+
+    if (notification === "GPIO_ERROR") {
       Log.error("[MMM-PageBtn] GPIO error: " + payload);
-    } else if (notification === "DEBUG") {
-      // Only surface node_helper debug chatter in debug mode
-      this.logDebug(payload);
+      return;
+    }
+
+    // DEBUG messages only in debug mode
+    if (notification === "DEBUG" && this.logLevel === "debug") {
+      Log.log("[MMM-PageBtn] " + payload);
     }
   },
 
   handleShortPress: function () {
-    // Minimal operational breadcrumb
-    this.logOn("Short press detected");
-
-    // Debug detail if desired
-    this.logDebug("Sending PAGE_INCREMENT");
+    // Minimal operational logging
+    if (this.logLevel === "on" || this.logLevel === "debug") {
+      Log.log("[MMM-PageBtn] Short press detected");
+    }
 
     this.sendNotification("PAGE_INCREMENT");
 
-    // If paused, short press resumes rotation and cancels auto-resume timer
+    // If paused, resume immediately on short press (behavior unchanged)
     if (this.paused) {
       this.paused = false;
+
       if (this.resumeTimer) {
         clearTimeout(this.resumeTimer);
         this.resumeTimer = null;
       }
+
       this.sendNotification("RESUME_ROTATION");
-      this.logDebug("Resumed rotation via short press (sent RESUME_ROTATION)");
+
+      if (this.logLevel === "debug") {
+        Log.log("[MMM-PageBtn] Resumed rotation via short press");
+      }
     }
   },
 
   handleLongPress: function () {
-    // Minimal operational breadcrumb
-    this.logOn("Long press detected");
+    if (this.logLevel === "on" || this.logLevel === "debug") {
+      Log.log("[MMM-PageBtn] Long press detected");
+    }
 
-    this.logDebug("Long press handler entered, paused=" + this.paused);
-
-    // Reset any existing auto-resume timer
+    // Reset existing timer
     if (this.resumeTimer) {
       clearTimeout(this.resumeTimer);
       this.resumeTimer = null;
-      this.logDebug("Cleared existing resume timer");
     }
 
     // Pause rotation (idempotent)
     if (!this.paused) {
       this.paused = true;
       this.sendNotification("PAUSE_ROTATION");
-      this.logDebug("Sent PAUSE_ROTATION");
+
+      if (this.logLevel === "debug") {
+        Log.log("[MMM-PageBtn] Sent PAUSE_ROTATION");
+      }
     }
 
-    // Auto-resume after configured delay
+    // Auto-resume timer
     this.resumeTimer = setTimeout(() => {
       this.paused = false;
       this.sendNotification("RESUME_ROTATION");
 
-      // Minimal operational breadcrumb
-      this.logOn("Auto-resume page rotation");
+      // Minimal operational logging requirement
+      if (this.logLevel === "on" || this.logLevel === "debug") {
+        Log.log("[MMM-PageBtn] Auto-resume page rotation");
+      }
 
-      this.logDebug("Auto-resume: sent RESUME_ROTATION");
+      if (this.logLevel === "debug") {
+        Log.log("[MMM-PageBtn] Sent RESUME_ROTATION");
+      }
     }, this.config.resumeAfterMs);
+  },
 
-    this.logDebug("Resume timer set for " + this.config.resumeAfterMs + "ms");
+  _getLogLevel: function (cfg) {
+    const raw = (cfg && cfg.logging) ? String(cfg.logging).toLowerCase() : "";
+    if (raw === "off" || raw === "on" || raw === "debug") return raw;
+
+    // Backward compatibility with debug: true/false
+    if (cfg && typeof cfg.debug === "boolean") {
+      return cfg.debug ? "debug" : "off";
+    }
+
+    return "off";
   },
 
   getDom: function () {

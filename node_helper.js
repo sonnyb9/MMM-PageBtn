@@ -5,60 +5,40 @@ module.exports = NodeHelper.create({
   start: function () {
     this.config = null;
     this.gpioProcess = null;
-
-    // Press state
-    this._pressed = false;
-    this._pressStartTime = null;
-    this._longPressTimer = null;
-    this._longPressFired = false;
-
-    // Buffer for stdout so we can reliably process line-delimited gpiomon output
-    this._stdoutBuf = "";
+    this.pressStartTime = null;
 
     // Compatibility toggles for different libgpiod/gpiomon builds
     this._useDebounce = true;
     this._restartPending = false;
 
-    // Prefer stdbuf to force line-buffered output; fall back if not available.
-    this._useStdbuf = true;
+    // Software debounce fallback (when gpiomon --debounce isn't supported)
+    this._lastAcceptedEventAt = 0;
   },
 
   socketNotificationReceived: function (notification, payload) {
-    if (notification === "INIT") {
-      this.config = payload;
+    if (notification !== "INIT") return;
 
-      // Reset compatibility toggles on init
-      this._useDebounce = true;
-      this._restartPending = false;
-      this._useStdbuf = true;
+    this.config = payload || {};
 
-      // Reset press state
-      this._pressed = false;
-      this._pressStartTime = null;
-      this._longPressFired = false;
-      if (this._longPressTimer) {
-        clearTimeout(this._longPressTimer);
-        this._longPressTimer = null;
-      }
+    // Normalize logging mode -> boolean debug for helper logging
+    // logging: "debug" => debug=true
+    // logging: "on"/"off" => debug=false (no noisy debug)
+    const logMode = String(this.config.logging || "").toLowerCase();
+    const effectiveDebug =
+      logMode === "debug" ? true :
+      (typeof this.config.debug === "boolean" ? this.config.debug : false);
 
-      this.startGpioMonitor();
-    }
-  },
+    this.config.debug = effectiveDebug;
 
-  getLogMode: function () {
-    const raw = (this.config && this.config.logging) ? String(this.config.logging).toLowerCase() : null;
-    if (raw === "off" || raw === "on" || raw === "debug") return raw;
+    // Reset compatibility toggles on init
+    this._useDebounce = true;
+    this._restartPending = false;
 
-    // Legacy support: if someone still passes debug boolean
-    if (this.config && this.config.debug === true) return "debug";
-    return "off";
-  },
+    // Reset debounce timing
+    this._lastAcceptedEventAt = 0;
+    this.pressStartTime = null;
 
-  debug: function (message) {
-    if (this.getLogMode() === "debug") {
-      console.log("[MMM-PageBtn] " + message);
-      this.sendSocketNotification("DEBUG", message);
-    }
+    this.startGpioMonitor();
   },
 
   stopGpioMonitor: function () {
@@ -72,19 +52,6 @@ module.exports = NodeHelper.create({
     }
   },
 
-  spawnGpioMon: function (args) {
-    // Reset stdout buffer each time we start a fresh process
-    this._stdoutBuf = "";
-
-    if (this._useStdbuf) {
-      // Force line-buffered stdout/stderr so events appear immediately when spawned by Node.
-      return spawn("stdbuf", ["-oL", "-eL", "gpiomon", ...args]);
-    }
-
-    // Fallback path if stdbuf is not available
-    return spawn("gpiomon", args);
-  },
-
   startGpioMonitor: function () {
     const chip = this.config.gpioChip || "gpiochip0";
     const line = this.config.gpioLine || 17;
@@ -93,7 +60,7 @@ module.exports = NodeHelper.create({
     // Stop any previous gpiomon process before starting a new one
     this.stopGpioMonitor();
 
-    // Use split edge flags for compatibility
+    // Use split edge flags for compatibility (your Pi build doesn't support --edges=both)
     const args = ["--bias=pull-up", "--rising-edge", "--falling-edge"];
 
     // Some builds may not support --debounce; we fall back automatically if needed
@@ -103,24 +70,13 @@ module.exports = NodeHelper.create({
 
     args.push(chip, String(line));
 
-    this.debug(
-      "Starting gpiomon with args: " +
-        args.join(" ") +
-        (this._useStdbuf ? " (via stdbuf)" : "")
-    );
+    this.debug("Starting gpiomon with args: " + args.join(" "));
 
-    this.gpioProcess = this.spawnGpioMon(args);
+    this.gpioProcess = spawn("gpiomon", args);
 
     this.gpioProcess.stdout.on("data", (data) => {
-      // Robust line buffering: handle partial chunks and multiple lines in one chunk.
-      this._stdoutBuf += data.toString();
-
-      let idx;
-      while ((idx = this._stdoutBuf.indexOf("\n")) !== -1) {
-        const line = this._stdoutBuf.slice(0, idx).trim();
-        this._stdoutBuf = this._stdoutBuf.slice(idx + 1);
-        if (line) this.handleGpioEvent(line);
-      }
+      const lines = data.toString().trim().split("\n");
+      lines.forEach((l) => this.handleGpioEvent(l));
     });
 
     this.gpioProcess.stderr.on("data", (data) => {
@@ -139,7 +95,6 @@ module.exports = NodeHelper.create({
         this._useDebounce = false;
         this._restartPending = true;
 
-        // Kill current process and restart quickly without debounce
         this.stopGpioMonitor();
         setTimeout(() => {
           this._restartPending = false;
@@ -161,85 +116,73 @@ module.exports = NodeHelper.create({
     });
 
     this.gpioProcess.on("error", (err) => {
-      // If stdbuf isn't installed, fall back to running gpiomon directly.
-      if (this._useStdbuf && err && err.code === "ENOENT") {
-        this.debug('stdbuf not found; falling back to spawning "gpiomon" directly.');
-        this._useStdbuf = false;
-        setTimeout(() => this.startGpioMonitor(), 250);
-        return;
-      }
-
       this.sendSocketNotification("GPIO_ERROR", "Failed to start gpiomon: " + err.message);
       setTimeout(() => this.startGpioMonitor(), 5000);
     });
   },
 
   handleGpioEvent: function (line) {
+    // Normalize
+    const normalized = (line || "").toLowerCase();
+
+    // Software debounce fallback:
+    // When gpiomon lacks --debounce, some switches produce rapid bursts of edges.
+    // Ignore any events occurring within debounceMs of the last accepted event.
+    const now = Date.now();
+    const debounceMs = this.config.debounceMs || 50;
+    if (now - this._lastAcceptedEventAt < debounceMs) {
+      this.debug("Debounce: ignoring event: " + line);
+      return;
+    }
+
+    // Accept this event
+    this._lastAcceptedEventAt = now;
+
     this.debug("GPIO event: " + line);
 
-    const normalized = (line || "").toLowerCase();
-    const now = Date.now();
-    const longPressMs = (this.config && this.config.longPressMs) || 1000;
-
-    // Press (FALLING with pull-up wiring)
     if (normalized.includes("falling")) {
-      // Ignore bounce / duplicate FALLING while already pressed
-      if (this._pressed) return;
+      // If we already think the button is down, ignore extra falling edges
+      if (this.pressStartTime !== null) {
+        this.debug("Extra falling edge while pressed; ignoring");
+        return;
+      }
 
-      this._pressed = true;
-      this._pressStartTime = now;
-      this._longPressFired = false;
-
-      // Start long-press timer; fire LONG_PRESS at threshold even before release
-      if (this._longPressTimer) clearTimeout(this._longPressTimer);
-      this._longPressTimer = setTimeout(() => {
-        // Only fire if still pressed and not already fired
-        if (this._pressed && !this._longPressFired) {
-          this._longPressFired = true;
-          this.debug("Long press detected (timer fired)");
-          this.sendSocketNotification("LONG_PRESS");
-        }
-      }, longPressMs);
-
+      this.pressStartTime = now;
       this.debug("Button pressed (falling edge)");
       return;
     }
 
-    // Release (RISING)
     if (normalized.includes("rising")) {
-      // Ignore stray RISING if we never saw a press
-      if (!this._pressed) return;
-
-      this._pressed = false;
-
-      if (this._longPressTimer) {
-        clearTimeout(this._longPressTimer);
-        this._longPressTimer = null;
-      }
-
-      const duration = this._pressStartTime ? now - this._pressStartTime : 0;
-      this._pressStartTime = null;
-
-      this.debug("Button released (rising edge), duration: " + duration + "ms");
-
-      // If long press already fired, do not also send SHORT_PRESS
-      if (this._longPressFired) {
-        this.debug("Release after long press; not sending short press.");
-        this._longPressFired = false; // reset for next cycle
+      if (this.pressStartTime === null) {
+        this.debug("Rising edge without prior falling edge, ignoring");
         return;
       }
 
-      // Otherwise it was a short press
-      this.debug("Short press detected");
-      this.sendSocketNotification("SHORT_PRESS");
+      const pressDuration = now - this.pressStartTime;
+      this.pressStartTime = null;
+
+      this.debug("Button released (rising edge), duration: " + pressDuration + "ms");
+
+      const longPressMs = this.config.longPressMs || 1000;
+
+      if (pressDuration >= longPressMs) {
+        this.debug("Long press detected");
+        this.sendSocketNotification("LONG_PRESS");
+      } else {
+        this.debug("Short press detected");
+        this.sendSocketNotification("SHORT_PRESS");
+      }
+    }
+  },
+
+  debug: function (message) {
+    if (this.config && this.config.debug) {
+      console.log("[MMM-PageBtn] " + message);
+      this.sendSocketNotification("DEBUG", message);
     }
   },
 
   stop: function () {
-    if (this._longPressTimer) {
-      clearTimeout(this._longPressTimer);
-      this._longPressTimer = null;
-    }
     this.stopGpioMonitor();
   }
 });
