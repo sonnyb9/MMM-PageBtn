@@ -47,7 +47,7 @@ Connect a momentary pushbutton between GPIO17 and GND:
 Before configuring MagicMirror, verify your wiring:
 
 ```bash
-sudo gpiomon --bias=pull-up --edges=both gpiochip0 17
+sudo gpiomon --bias=pull-up --rising-edge --falling-edge gpiochip0 17
 ```
 
 Press and release the button. You should see `falling` and `rising` edge events.
@@ -100,8 +100,8 @@ Add to your `config/config.js`:
 ### Button not detected
 
 1. Verify `gpiod` is installed: `which gpiomon`
-2. Test GPIO manually: `sudo gpiomon --bias=pull-up --edges=both gpiochip0 17`
-3. Check wiring — button should connect GPIO pin to GND
+2. Test GPIO manually: `sudo gpiomon --bias=pull-up --rising-edge --falling-edge gpiochip0 17`
+3. Check wiring — button should connect GPIO (pin 11) to GND (pin 9 or any of the other GND pins available)
 4. Enable debug mode: `debug: true` in config
 
 ### Permission denied

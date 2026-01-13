@@ -2,31 +2,56 @@ const NodeHelper = require("node_helper");
 const { spawn } = require("child_process");
 
 module.exports = NodeHelper.create({
-  start: function() {
+  start: function () {
     this.config = null;
     this.gpioProcess = null;
     this.pressStartTime = null;
+
+    // Compatibility toggles for different libgpiod/gpiomon builds
+    this._useDebounce = true;
+    this._restartPending = false;
   },
 
-  socketNotificationReceived: function(notification, payload) {
+  socketNotificationReceived: function (notification, payload) {
     if (notification === "INIT") {
       this.config = payload;
+
+      // Reset compatibility toggles on init
+      this._useDebounce = true;
+      this._restartPending = false;
+
       this.startGpioMonitor();
     }
   },
 
-  startGpioMonitor: function() {
+  stopGpioMonitor: function () {
+    if (this.gpioProcess) {
+      try {
+        this.gpioProcess.kill();
+      } catch (e) {
+        // ignore
+      }
+      this.gpioProcess = null;
+    }
+  },
+
+  startGpioMonitor: function () {
     const chip = this.config.gpioChip || "gpiochip0";
     const line = this.config.gpioLine || 17;
     const debounceUs = (this.config.debounceMs || 50) * 1000;
 
-    const args = [
-      "--bias=pull-up",
-      "--edges=both",
-      "--debounce=" + debounceUs + "us",
-      chip,
-      String(line)
-    ];
+    // Stop any previous gpiomon process before starting a new one
+    this.stopGpioMonitor();
+
+    // Use split edge flags for compatibility (your Pi build doesn't support --edges=both)
+    const args = ["--bias=pull-up", "--rising-edge", "--falling-edge"];
+
+    // Some builds may not support --debounce; we fall back automatically if needed
+    if (this._useDebounce) {
+      args.push("--debounce=" + debounceUs + "us");
+    }
+
+    args.push(chip, String(line));
 
     this.debug("Starting gpiomon with args: " + args.join(" "));
 
@@ -38,11 +63,36 @@ module.exports = NodeHelper.create({
     });
 
     this.gpioProcess.stderr.on("data", (data) => {
-      this.sendSocketNotification("GPIO_ERROR", data.toString());
+      const msg = data.toString();
+      this.sendSocketNotification("GPIO_ERROR", msg);
+
+      // Compatibility fallback: some gpiomon/libgpiod builds do not support --debounce
+      const lower = msg.toLowerCase();
+      if (
+        this._useDebounce &&
+        !this._restartPending &&
+        lower.includes("unrecognized option") &&
+        lower.includes("debounce")
+      ) {
+        this.debug("gpiomon does not support --debounce; restarting without debounce.");
+        this._useDebounce = false;
+        this._restartPending = true;
+
+        // Kill current process and restart quickly without debounce
+        this.stopGpioMonitor();
+        setTimeout(() => {
+          this._restartPending = false;
+          this.startGpioMonitor();
+        }, 250);
+      }
     });
 
     this.gpioProcess.on("close", (code) => {
       this.debug("gpiomon exited with code " + code);
+
+      // If we're in the middle of a controlled restart, don't schedule another restart
+      if (this._restartPending) return;
+
       if (code !== 0 && code !== null) {
         this.sendSocketNotification("GPIO_ERROR", "gpiomon exited with code " + code);
         setTimeout(() => this.startGpioMonitor(), 5000);
@@ -55,13 +105,16 @@ module.exports = NodeHelper.create({
     });
   },
 
-  handleGpioEvent: function(line) {
+  handleGpioEvent: function (line) {
     this.debug("GPIO event: " + line);
 
-    if (line.includes("falling")) {
+    // gpiomon emits "RISING EDGE" / "FALLING EDGE" (uppercase); normalize for matching.
+    const normalized = (line || "").toLowerCase();
+
+    if (normalized.includes("falling")) {
       this.pressStartTime = Date.now();
       this.debug("Button pressed (falling edge)");
-    } else if (line.includes("rising")) {
+    } else if (normalized.includes("rising")) {
       if (this.pressStartTime === null) {
         this.debug("Rising edge without prior falling edge, ignoring");
         return;
@@ -84,17 +137,14 @@ module.exports = NodeHelper.create({
     }
   },
 
-  debug: function(message) {
+  debug: function (message) {
     if (this.config && this.config.debug) {
       console.log("[MMM-PageBtn] " + message);
       this.sendSocketNotification("DEBUG", message);
     }
   },
 
-  stop: function() {
-    if (this.gpioProcess) {
-      this.gpioProcess.kill();
-      this.gpioProcess = null;
-    }
+  stop: function () {
+    this.stopGpioMonitor();
   }
 });
